@@ -3680,10 +3680,10 @@ def test_the_characters_the_serializer_escapes():
     [
         ("\t", "\\t"),
         ("\\", "\\\\"),
-        ("", "\\u007f"),
-        ("­", "\\u00ad"),
-        ("​", "\\u200b"),
-        ("", "\\u2028"),
+        ("\u007f", "\\u007f"),
+        ("\u00ad", "\\u00ad"),
+        ("\u200b", "\\u200b"),
+        ("\u2028", "\\u2028"),
         ("\U0001d173", "\\ud834\\udd73"),
         ("\U000e0001", "\\udb40\\udc01"),
     ],
@@ -3705,10 +3705,10 @@ def test_a_callback_name_reaches_the_wrapper_escaped(client, admin_h, ch, writte
 @pytest.mark.parametrize(
     "ch, written",
     [
-        ("­", "\\u00ad"),
-        ("", "\\u007f"),
-        ("​", "\\u200b"),
-        ("", "\\u2028"),
+        ("\u00ad", "\\u00ad"),
+        ("\u007f", "\\u007f"),
+        ("\u200b", "\\u200b"),
+        ("\u2028", "\\u2028"),
         ("\U0001d173", "\\ud834\\udd73"),
     ],
 )
