@@ -24,7 +24,7 @@ import re
 from functools import lru_cache
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 
 from backlot import auth, store, synth
@@ -143,6 +143,55 @@ _B_BATCH = {
 def _error(status: int, message: str, category: str = "VALIDATION_ERROR") -> JSONResponse:
     return JSONResponse(
         status_code=status, content={"status": "error", "message": message, "category": category}
+    )
+
+
+# Real's answer on the record route for an id that parses but names nothing visible: this page,
+# 197 bytes, under a Latin-1 content type although its own `<meta>` says utf-8. `contacts/1`,
+# `contacts/9223372036854775807` and `deals/{a contact's id}` answered it byte for byte the same
+# against api.hubapi.com on 2026-09-30, 2026-10-14 and 2026-10-15.
+_MISSING_RECORD_PAGE = (
+    b"<html>\n<head>\n"
+    b'<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
+    b"<title>Error 404 Not Found</title>\n</head>\n"
+    b"<body><h2>HTTP ERROR 404</h2>\n<p>Resource not found</p>\n</body>\n</html>\n"
+)
+
+
+def _missing_record() -> Response:
+    return Response(
+        _MISSING_RECORD_PAGE, status_code=404, media_type="text/html;charset=iso-8859-1"
+    )
+
+
+def _record_id(record_id: str) -> str | JSONResponse:
+    """The id to look up, or real's 404 for one it won't look up.
+
+    Measured on the record and v4 associations routes (api.hubapi.com, 2026-09-30, 2026-10-14):
+    `0<a contact's id>`, `1` and `9223372036854775807` are looked up; `0` and `-1` are
+    `objectId is usually positive.`; `+1`, `1.0`, U+0661, `abc`, `9223372036854775808` and
+    `99999999999999999999999` are `objectId are usually numeric.`, with two spaces. `context.id`
+    holds the id as sent. Those ids fit one reading, applied here to every id: ASCII digits, an
+    optional `-` and leading zeros, naming a signed 64-bit value, looked up above 0 and "positive"
+    otherwise, and anything that doesn't parse "numeric". Real's body also carries a
+    `correlationId`, which this one leaves out."""
+    # At most 19 significant digits, so `int` never meets a string too long for it to convert.
+    m = re.fullmatch(r"(-?)0*([0-9]{1,19})", record_id)
+    value = int(m[1] + m[2]) if m else None
+    if value is not None and -(2**63) <= value < 2**63:
+        if value > 0:
+            return str(value)
+        message = "Object not found. objectId is usually positive."
+    else:
+        message = "Object not found.  objectId are usually numeric."
+    return JSONResponse(
+        status_code=404,
+        content={
+            "status": "error",
+            "message": message,
+            "context": {"id": [record_id]},
+            "category": "OBJECT_NOT_FOUND",
+        },
     )
 
 
@@ -352,6 +401,12 @@ _PLURAL = {plural: singular for singular, plural in _SINGULAR.items()}
 # Backlot cannot verify is a name it would be inventing; an unmapped id stays a 400 rather than
 # resolving to a guess.
 #
+# Three more are mapped from real's own answers rather than from that list (measured 2026-10-09
+# and 2026-10-15): `0-18`, `0-72` and `0-64` serve the same records as `communications`,
+# `deal_splits` and `quote_templates` on the listing, and `0-64` on a record, search and batch/read
+# too; `archived=true` on each id is the refusal its name gets, naming the same id; and the v4
+# associations route reads each id on either side as it reads the name.
+#
 # A custom object is a `2-<n>`, and its records are addressed here by the name the corpus gave it.
 # HubSpot's own alias for one is `p_<name>` (or the fully qualified `p<portalId>_<name>`), but both
 # forms answer 400 `Unable to infer object type from: <name>` on a portal that does not hold that
@@ -365,12 +420,15 @@ _TYPE_IDS = {
     "0-7": "products",
     "0-8": "line_items",
     "0-14": "quotes",
+    "0-18": "communications",
     "0-19": "feedback_submissions",
     "0-27": "tasks",
     "0-46": "notes",
     "0-47": "meetings",
     "0-48": "calls",
     "0-49": "emails",
+    "0-64": "quote_templates",
+    "0-72": "deal_splits",
 }
 # The shape of an objectTypeId, for telling "an id I do not know" apart from "not a type at all":
 # HubSpot answers those two with different messages.
@@ -566,6 +624,7 @@ _OPERATOR_INDEXES = frozenset(str(i) for i in range(len(_OPERATORS)))
 # it does not (measured 2026-10-06).
 _TRIM = "".join(map(chr, range(0x21)))
 _WS = re.compile(r"[ \t\n\r]*")
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
 
 
 def _operator(f: dict):
@@ -575,11 +634,15 @@ def _operator(f: dict):
 def _token_at(raw: bytes, path: tuple) -> tuple[int, int]:
     """Where the value at `path` starts in the JSON body `raw`, as real reports a position: a
     1-based line and a 1-based column counted in UTF-8 bytes, so `ééé` before the value moves it
-    six columns and a CRLF line ending none (measured 2026-10-06). A key the body repeats resolves
-    to its last occurrence, the one `json.loads` keeps."""
-    text = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    six columns and a CRLF line ending none (measured 2026-10-06), a lone CR is a line break and a
+    byte-order mark three columns of line 1 (2026-10-13). A key the body repeats resolves to its
+    last occurrence, the one `json.loads` keeps."""
+    encoding = json.detect_encoding(raw)
+    if encoding == "utf-8-sig":
+        encoding = "utf-8"
+    text = raw.decode(encoding, "surrogatepass")
     decoder = json.JSONDecoder()
-    pos = _WS.match(text).end()
+    pos = _WS.match(text, 1 if text.startswith("\ufeff") else 0).end()
     for step in path:
         pos = _WS.match(text, pos + 1).end()
         if isinstance(step, int):
@@ -602,9 +665,13 @@ def _token_at(raw: bytes, path: tuple) -> tuple[int, int]:
 
 def _position(text: str, pos: int) -> tuple[int, int]:
     """The offset `pos` into the decoded body `text` as `_token_at` reports a position."""
-    line_start = text.rfind("\n", 0, pos) + 1
+    line_start = 0
+    line = 1
+    for m in _LINE_BREAK_RE.finditer(text[:pos]):
+        line_start = m.end()
+        line += 1
     column = len(text[line_start:pos].encode("utf-8", "surrogatepass")) + 1
-    return text.count("\n", 0, pos) + 1, column
+    return line, column
 
 
 # A JSON string, or one of the three number tokens `json.loads` reads and JSON does not have. A
@@ -627,6 +694,8 @@ def _non_standard_number(raw: bytes) -> tuple[tuple[int, int], JSONResponse] | t
     first such byte is scanned: a token there is named, and a body with none is left to the route.
     `json.loads` reads the three as floats, so without this the routes answer for a float there."""
     encoding = json.detect_encoding(raw)
+    if encoding == "utf-8-sig":
+        encoding = "utf-8"
     try:
         text = raw.decode(encoding, "surrogatepass")
     except UnicodeDecodeError as e:
@@ -811,12 +880,22 @@ def _match_one(prop, f: dict) -> bool:
     target = f.get("value")
     cands = _values_of(prop)
 
+    # Real compares a value with no regard to case, except on an enumeration property, which it
+    # compares exactly: "When filtering for an enumeration property, search is case-sensitive for
+    # all filter operators" (the search guide). Measured against api.hubapi.com: `firstname`,
+    # `name` and `domain` matched in any case on 2026-10-09 and 2026-10-16, and on 2026-10-16
+    # `lifecyclestage EQ LEAD`, `dealstage EQ APPOINTMENTSCHEDULED` and `pipeline EQ DEFAULT`
+    # answered nothing where the lower-case values matched. The four below are the enumerations
+    # (`/crm/v3/properties`, 2026-10-16) among the properties the bundled records carry. Real also
+    # folds accents (`MARÍA` and `marıa` match `Maria`), which `str.lower` does not.
+    exact = f.get("propertyName") in {"lifecyclestage", "dealstage", "pipeline", "industry"}
+    fold = str if exact else str.lower
     if op in ("EQ", "NEQ"):
-        hit = any(c == str(target) for c in cands)
+        hit = any(fold(c) == fold(str(target)) for c in cands)
         return hit if op == "EQ" else not hit
     if op in ("IN", "NOT_IN"):
-        wanted = {str(v) for v in (f.get("values") or [])}
-        hit = any(c in wanted for c in cands)
+        wanted = {fold(str(v)) for v in (f.get("values") or [])}
+        hit = any(fold(c) in wanted for c in cands)
         return hit if op == "IN" else not hit
     if op in ("CONTAINS_TOKEN", "NOT_CONTAINS_TOKEN"):
         pats = _token_patterns(str(target or ""))
@@ -1021,6 +1100,9 @@ async def get_object(object_type: str, record_id: str, request: Request):
     # non-numeric and a negative one (2026-10-12).
     if _resolve_type(request, object_type) is None:
         return _unknown_type(object_type)
+    record_id = _record_id(record_id)
+    if isinstance(record_id, JSONResponse):
+        return record_id
     # One ACL-scoped query, not a resolve followed by a get_document refetch of the same row:
     # `id` is the PRIMARY KEY, so the ACL clause can only narrow "found" to "not found", never
     # redirect to a different row (see store.hubspot_by_id).
@@ -1030,7 +1112,7 @@ async def get_object(object_type: str, record_id: str, request: Request):
         or row["object_type"] not in _aliases(object_type)
         or _hidden_archived(row, request)
     ):
-        return _error(404, "resource not found", "OBJECT_NOT_FOUND")
+        return _missing_record()
     return _record(row, _keep(request.query_params.get("properties")))
 
 
@@ -1163,18 +1245,17 @@ async def list_associations(
     if caller is None:
         return _error(401, "Authentication credentials not found.", "INVALID_AUTHENTICATION")
     # In the order real answers them (api.hubapi.com, 2026-09-30 for the types and the empty page,
-    # 2026-10-12 for the rest): a type real cannot infer is its 400 on either side of the path, the
-    # source's when both are; a record id that is not ASCII digits naming 1 to 2**63 - 1, leading
-    # zeros allowed, is a 404 (measured on `abc`, `1.0`, a leading `+`, U+0661, `0`, `-1` and
-    # `9223372036854775808`; real's 404 body differs from this one); then the `after` cursor; then a
-    # record that does not exist, or is of another type, is an empty page. The target is read under
-    # any of its spellings (`company` and `0-2` answer as `companies`).
+    # 2026-10-12 and 2026-10-14 for the rest): a type real cannot infer is its 400 on either side of
+    # the path, the source's when both are; a record id it won't look up is the 404 `_record_id`
+    # describes; then the `after` cursor; then a record that does not exist, or is of another type,
+    # is an empty page, not the record route's HTML 404. The target is read under any of its
+    # spellings (`company` and `0-2` answer as `companies`).
     for name in (object_type, to_object_type):
         if _resolve_type(request, name) is None:
             return _unknown_type(name)
-    digits = re.fullmatch(r"0*([1-9][0-9]{0,18})", record_id)
-    if digits is None or int(digits[1]) >= 2**63:
-        return _error(404, "resource not found", "OBJECT_NOT_FOUND")
+    record_id = _record_id(record_id)
+    if isinstance(record_id, JSONResponse):
+        return record_id
     conn, visible = auth.conn(request), auth.visible_ids(request, caller)
     limit = _clamp(request.query_params.get("limit"), _ASSOC_PAGE_MAX, _ASSOC_PAGE_MAX)
     after_to, err = _resolve_cursor(request, request.query_params.get("after"))

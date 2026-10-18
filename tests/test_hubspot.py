@@ -96,9 +96,11 @@ def test_hubspot_archived_parameter_reads_its_first_value_and_only_true_as_true(
             assert (got.status_code, got.json()["id"]) == (200, rid)
             assert (batch.status_code, [x["id"] for x in batch.json()["results"]]) == (200, [rid])
         else:
-            assert (got.status_code, got.json()) == (
+            gone = client.get(f"{url}/{missing}", headers=admin_h)
+            assert (got.status_code, got.headers["content-type"], got.content) == (
                 404,
-                client.get(f"{url}/{missing}", headers=admin_h).json(),
+                gone.headers["content-type"],
+                gone.content,
             )
             assert (batch.status_code, json.loads(batch.text.replace(rid, missing))) == (
                 207,
@@ -329,6 +331,57 @@ def test_hubspot_an_object_type_id_is_a_spelling_of_its_type(client, admin_h, as
     ]
 
 
+def test_hubspot_0_18_0_72_0_64_are_their_types(tmp_path):
+    """The three pairings the comment above `_TYPE_IDS` records, over a corpus holding one quote
+    template."""
+    from tests._helpers import client_for
+
+    records = [
+        {
+            "source_type": "hubspot",
+            "doc_id": "hs-quote-template",
+            "object_type": "quote_templates",
+            "title": "Standard",
+            "content": "Standard template.",
+            "author_email": "rep@acme.com",
+            "created": "2026-03-01T09:00:00Z",
+            "properties": {"hs_name": "Standard"},
+        },
+    ]
+    settings = tiny_corpus(tmp_path, records)
+    with client_for(settings, reload=True) as c:
+        h = {"Authorization": f"Bearer {settings.admin_token}"}
+        rid = served_id("hubspot", "hs-quote-template")
+        for asked, named, label in (
+            ("0-18", "communications", "0-18 (COMMUNICATION)"),
+            ("0-72", "deal_splits", "0-72 (DEAL_SPLIT)"),
+            ("0-64", "quote_templates", "0-64 (QUOTE_TEMPLATE)"),
+        ):
+            listed = c.get(f"/hubspot/crm/v3/objects/{asked}", headers=h)
+            assert listed.status_code == 200, (asked, listed.json())
+            by_name = c.get(f"/hubspot/crm/v3/objects/{named}", headers=h)
+            assert listed.json()["results"] == by_name.json()["results"], asked
+            searched = c.post(f"/hubspot/crm/v3/objects/{asked}/search", headers=h, json={})
+            assert searched.status_code == 200, asked
+            assert searched.json()["total"] == (1 if asked == "0-64" else 0), asked
+            archived = c.get(
+                f"/hubspot/crm/v3/objects/{asked}", headers=h, params={"archived": "true"}
+            )
+            assert archived.status_code == 400, asked
+            assert archived.json()["message"] == (
+                f"Paging through deleted objects is not yet supported for object type {label}"
+            )
+        assert c.get(f"/hubspot/crm/v3/objects/0-64/{rid}", headers=h).json()["id"] == rid
+        read = c.post(
+            "/hubspot/crm/v3/objects/0-64/batch/read", headers=h, json={"inputs": [{"id": rid}]}
+        )
+        assert read.status_code == 200
+        assert [r["id"] for r in read.json()["results"]] == [rid]
+        for to in ("contacts", "0-18"):
+            linked = c.get(f"/hubspot/crm/v4/objects/0-64/{rid}/associations/{to}", headers=h)
+            assert (linked.status_code, linked.json()) == (200, {"results": []}), to
+
+
 def test_hubspot_one_type_stated_both_ways_is_one_type(tmp_path):
     """A portal has ONE `deals` type, so no HubSpot response can show a record under
     `/objects/deal/{id}` that `/objects/deal` never lists. Resolving to the first spelling that
@@ -433,6 +486,14 @@ def test_hubspot_missing_record_is_404(client, admin_h):
     )
 
 
+_MISSING_RECORD_PAGE = (
+    b"<html>\n<head>\n"
+    b'<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
+    b"<title>Error 404 Not Found</title>\n</head>\n"
+    b"<body><h2>HTTP ERROR 404</h2>\n<p>Resource not found</p>\n</body>\n</html>\n"
+)
+
+
 def test_hubspot_unauth_is_401(client):
     assert client.get("/hubspot/crm/v3/objects/companies").status_code == 401
 
@@ -457,9 +518,11 @@ def test_hubspot_acl_hides_restricted_record(client, tokens_yaml, admin_h):
         for r in crawl_hubspot(client, admin_h, "companies")
         if r["properties"].get("name") == "Stealth Health Co"
     )
-    url = f"/hubspot/crm/v3/objects/companies/{secret['id']}"
-    assert client.get(url, headers=ava_h).status_code == 404
-    assert client.get(url, headers=hana_h).status_code == 200
+    for record in (secret["id"], "0" + secret["id"]):
+        url = f"/hubspot/crm/v3/objects/companies/{record}"
+        hidden = client.get(url, headers=ava_h)
+        assert (hidden.status_code, hidden.content) == (404, _MISSING_RECORD_PAGE), record
+        assert client.get(url, headers=hana_h).status_code == 200, record
 
 
 def test_hubspot_associations_v4(client, admin_h):
@@ -497,7 +560,20 @@ def _cannot_infer(name):
 
 
 _EMPTY = {"results": []}
-_NOT_FOUND = {"status": "error", "message": "resource not found", "category": "OBJECT_NOT_FOUND"}
+
+
+def _not_looked_up(record, why):
+    """Real's 404 for an id it won't look up: `why` is "numeric" or "positive"."""
+    message = {
+        "numeric": "Object not found.  objectId are usually numeric.",
+        "positive": "Object not found. objectId is usually positive.",
+    }[why]
+    return {
+        "status": "error",
+        "message": message,
+        "context": {"id": [record]},
+        "category": "OBJECT_NOT_FOUND",
+    }
 
 
 @pytest.mark.parametrize(
@@ -515,13 +591,50 @@ _NOT_FOUND = {"status": "error", "message": "resource not found", "category": "O
         (_assoc("9223372036854775807"), 200, _EMPTY),
         (_assoc("0" * 25 + "1"), 200, _EMPTY),
         (_assoc("{ava}", source="deals"), 200, _EMPTY),
-        (_assoc("abc"), 404, _NOT_FOUND),
-        (_assoc("1.0"), 404, _NOT_FOUND),
-        (_assoc("\u0661"), 404, _NOT_FOUND),
-        (_assoc("0"), 404, _NOT_FOUND),
-        (_assoc("-1"), 404, _NOT_FOUND),
-        (_assoc("9223372036854775808"), 404, _NOT_FOUND),
-        (_assoc("abc") + "?after=bogus", 404, _NOT_FOUND),
+        (_assoc("0{ava}"), 200, _assoc("{ava}")),
+        (_assoc("abc"), 404, _not_looked_up("abc", "numeric")),
+        (_assoc("1.0"), 404, _not_looked_up("1.0", "numeric")),
+        (_assoc("+1"), 404, _not_looked_up("+1", "numeric")),
+        (_assoc("\u0661"), 404, _not_looked_up("\u0661", "numeric")),
+        (_assoc("0"), 404, _not_looked_up("0", "positive")),
+        (_assoc("-1"), 404, _not_looked_up("-1", "positive")),
+        (_assoc("9223372036854775808"), 404, _not_looked_up("9223372036854775808", "numeric")),
+        (_assoc("abc") + "?after=bogus", 404, _not_looked_up("abc", "numeric")),
+        ("/crm/v3/objects/contacts/0{ava}", 200, "/crm/v3/objects/contacts/{ava}"),
+        ("/crm/v3/objects/contacts/abc", 404, _not_looked_up("abc", "numeric")),
+        ("/crm/v3/objects/contacts/1.0", 404, _not_looked_up("1.0", "numeric")),
+        ("/crm/v3/objects/contacts/+1", 404, _not_looked_up("+1", "numeric")),
+        ("/crm/v3/objects/contacts/\u0661", 404, _not_looked_up("\u0661", "numeric")),
+        (
+            "/crm/v3/objects/contacts/99999999999999999999999",
+            404,
+            _not_looked_up("99999999999999999999999", "numeric"),
+        ),
+        (
+            "/crm/v3/objects/contacts/9223372036854775808",
+            404,
+            _not_looked_up("9223372036854775808", "numeric"),
+        ),
+        ("/crm/v3/objects/contacts/0", 404, _not_looked_up("0", "positive")),
+        ("/crm/v3/objects/contacts/-1", 404, _not_looked_up("-1", "positive")),
+        ("/crm/v3/objects/contacts/00", 404, _not_looked_up("00", "positive")),
+        ("/crm/v3/objects/contacts/-00", 404, _not_looked_up("-00", "positive")),
+        (
+            "/crm/v3/objects/contacts/-9223372036854775808",
+            404,
+            _not_looked_up("-9223372036854775808", "positive"),
+        ),
+        (
+            "/crm/v3/objects/contacts/-9223372036854775809",
+            404,
+            _not_looked_up("-9223372036854775809", "numeric"),
+        ),
+        # longer than `int` converts (4300 digits): the 23-digit row's answer, not a server error
+        ("/crm/v3/objects/contacts/" + "9" * 5000, 404, _not_looked_up("9" * 5000, "numeric")),
+        ("/crm/v3/objects/nosuch/abc", 400, _cannot_infer("nosuch")),
+        ("/crm/v3/objects/contacts/1", 404, _MISSING_RECORD_PAGE),
+        ("/crm/v3/objects/contacts/9223372036854775807", 404, _MISSING_RECORD_PAGE),
+        ("/crm/v3/objects/deals/{ava}", 404, _MISSING_RECORD_PAGE),
         (_assoc("1") + "?after=bogus", 400, _assoc("{ava}") + "?after=bogus"),
         (_assoc("{ava}", source="deals") + "?after=bogus", 400, _assoc("{ava}") + "?after=bogus"),
     ],
@@ -529,17 +642,22 @@ _NOT_FOUND = {"status": "error", "message": "resource not found", "category": "O
 def test_hubspot_object_types_resolve_as_real_resolves_them(
     client, admin_h, ava, path, status, want
 ):
-    """Each row is one that `_canonical`, `get_object` and `list_associations` record as measured.
-    Where `want` is a path, the row answers what that path does, here and on real: the target under
-    its plural, for another spelling of it; and Ava's own associations, for a bad `after`, since the
-    cursor is refused before a missing or mismatched record is an empty page."""
+    """Each row is one that `_canonical`, `_record_id`, `get_object` and `list_associations` record
+    as measured. Where `want` is a path, the row answers what that path does, here and on real: the
+    target under its plural, for another spelling of it; Ava's own associations, for a bad `after`,
+    since the cursor is refused before a missing or mismatched record is an empty page; and Ava
+    herself, or her associations, for her id with a leading zero. Where `want` is bytes, it is the
+    HTML page, under real's Latin-1 content type. A JSON answer's members come in real's order."""
     r = client.get("/hubspot" + path.format(ava=ava), headers=admin_h)
     assert r.status_code == status, path
+    if isinstance(want, bytes):
+        assert (r.headers["content-type"], r.content) == ("text/html;charset=iso-8859-1", want)
+        return
     if isinstance(want, str):
         twin = client.get("/hubspot" + want.format(ava=ava), headers=admin_h).json()
         assert twin != _EMPTY
         want = twin
-    assert r.json() == want
+    assert list(r.json().items()) == list(want.items())
 
 
 def test_hubspot_search_filter_groups(client, admin_h):
@@ -686,6 +804,53 @@ def test_hubspot_search_every_operator(client, admin_h):
     }
 
 
+def test_hubspot_search_string_filters_ignore_value_case(client, admin_h):
+    """A string property's value is compared in any case and an enumeration's exactly, as
+    `_match_one` records."""
+    f = lambda **kw: _hs_filter(client, admin_h, **kw)  # noqa: E731
+    others = {"Borealis Clinics", "Stealth Health Co"}
+
+    assert f(propertyName="name", operator="EQ", value="acme health") == {"Acme Health"}
+    assert f(propertyName="name", operator="EQ", value="ACME HEALTH") == {"Acme Health"}
+    assert f(propertyName="name", operator="NEQ", value="ACME HEALTH") == others
+    assert f(propertyName="name", operator="IN", values=["acme health"]) == {"Acme Health"}
+    assert f(propertyName="name", operator="NOT_IN", values=["ACME HEALTH"]) == others
+
+
+@pytest.mark.parametrize(
+    "object_type, prop, stored",
+    [
+        ("contacts", "lifecyclestage", "lead"),
+        ("deals", "dealstage", "closedwon"),
+        ("deals", "pipeline", "default"),
+        ("companies", "industry", "COMPUTER_SOFTWARE"),
+    ],
+)
+def test_hubspot_search_compares_an_enumeration_value_exactly(tmp_path, object_type, prop, stored):
+    """Each enumeration `_match_one` compares exactly is matched only as stored, under each of the
+    four operators."""
+    from tests._helpers import client_for
+
+    record = {"source_type": "hubspot", "doc_id": "hs-enum", "object_type": object_type}
+    s = tiny_corpus(tmp_path, [{**record, "title": "r", "properties": {prop: stored}}])
+    other = stored.swapcase()
+    with client_for(s, reload=True) as c:
+        h = {"Authorization": f"Bearer {s.admin_token}"}
+
+        def total(op, **value):
+            body = {
+                "filterGroups": [{"filters": [{"propertyName": prop, "operator": op, **value}]}]
+            }
+            return c.post(
+                f"/hubspot/crm/v3/objects/{object_type}/search", headers=h, json=body
+            ).json()["total"]
+
+        assert (total("EQ", value=stored), total("EQ", value=other)) == (1, 0)
+        assert (total("IN", values=[stored]), total("IN", values=[other])) == (1, 0)
+        assert (total("NEQ", value=stored), total("NEQ", value=other)) == (0, 1)
+        assert (total("NOT_IN", values=[stored]), total("NOT_IN", values=[other])) == (0, 1)
+
+
 @pytest.mark.parametrize(
     "prop, value, want",
     [
@@ -775,6 +940,11 @@ _OPERATOR_ROWS = [
     _op("default-separators", _jobtitle([("neq", "Salesperson")], compact=False), _enum_refusal(1, 73)),
     _op("indent", json.dumps(json.loads(_jobtitle([("neq", "Salesperson")])), indent=2), _enum_refusal(7, 23)),
     _op("crlf", json.dumps(json.loads(_jobtitle([("neq", "Salesperson")])), indent=2).replace("\n", "\r\n"), _enum_refusal(7, 23)),
+    _op("lone-cr", '{\r"filterGroups":[{"filters":[{"propertyName":"name","operator":"BOGUS"}]}]}', _enum_refusal(2, 63), object_type="companies"),
+    _op("byte-order-mark", '\ufeff{"filterGroups":[{"filters":[{"propertyName":"name","operator":"BOGUS"}]}]}', _enum_refusal(1, 67), object_type="companies"),
+    # a UTF-16 body is read in its own encoding, and its byte-order mark takes no column
+    _op("utf-16", '{"filterGroups":[{"filters":[{"propertyName":"name","operator":"BOGUS"}]}]}'.encode("utf-16-le"), _enum_refusal(1, 64), object_type="companies"),
+    _op("utf-16-byte-order-mark", '{"filterGroups":[{"filters":[{"propertyName":"name","operator":"BOGUS"}]}]}'.encode("utf-16"), _enum_refusal(1, 64), object_type="companies"),
     _op("tab-indent", json.dumps(json.loads(_jobtitle([("neq", "Salesperson")])), indent="\t"), _enum_refusal(7, 18)),
     _op("two-byte-chars-before", _value_first("ééé", ensure_ascii=False), _enum_refusal(1, 85)),
     _op("escaped-chars-before", _value_first("ééé", ensure_ascii=True), _enum_refusal(1, 97)),
@@ -825,7 +995,7 @@ def test_hubspot_search_reads_a_filter_operator_as_real_does(
     the body is served."""
     headers = {"Content-Type": "application/json", **(admin_h if authed else {})}
     url = f"/hubspot/crm/v3/objects/{object_type}/search"
-    r = client.post(url, headers=headers, content=raw.encode())
+    r = client.post(url, headers=headers, content=raw if isinstance(raw, bytes) else raw.encode())
     if isinstance(want, dict):
         assert (r.status_code, r.json()) == (400, want)
     elif isinstance(want, tuple):
@@ -1027,10 +1197,10 @@ def test_hubspot_batch_read(client, admin_h):
     assert {r["id"] for r in j["results"]} == set(ids)
 
 
-def _batch_refusal(column: int, text: str) -> dict:
+def _batch_refusal(column: int, text: str, line: int = 1) -> dict:
     return {
         "status": "error",
-        "message": f"Invalid input JSON on line 1, column {column}: {text}",
+        "message": f"Invalid input JSON on line {line}, column {column}: {text}",
         "category": "VALIDATION_ERROR",
     }
 
@@ -1065,6 +1235,9 @@ _ARRAY = "Cannot deserialize value of type  from Array value (token `JsonToken.S
 _BATCH_BODY_ROWS = [
     _br("inputs-string", '{"inputs":"x"}', _batch_refusal(11, _not_a_list("String", "VALUE_STRING"))),
     _br("inputs-blank-string", '{"inputs":" "}', _batch_refusal(11, _not_a_list("String", "VALUE_STRING"))),
+    _br("inputs-string-after-a-lone-cr", '{\r"inputs":"x"}', _batch_refusal(10, _not_a_list("String", "VALUE_STRING"), line=2)),
+    _br("inputs-string-after-crlf", '{\r\n"inputs":"x"}', _batch_refusal(10, _not_a_list("String", "VALUE_STRING"), line=2)),
+    _br("inputs-string-after-a-byte-order-mark", '\ufeff{"inputs":"x"}', _batch_refusal(14, _not_a_list("String", "VALUE_STRING"))),
     _br("inputs-object", '{"inputs":{"id":"1"}}', _batch_refusal(11, _not_a_list("Object", "START_OBJECT"))),
     _br("inputs-integer", '{"inputs":5}', _batch_refusal(11, _not_a_list("Integer", "VALUE_NUMBER_INT"))),
     _br("inputs-float", '{"inputs":1.5}', _batch_refusal(11, _not_a_list("Floating-point", "VALUE_NUMBER_FLOAT"))),
@@ -1168,6 +1341,9 @@ _TOKEN_ROWS = [
     # the position, counted as `_token_at` counts one
     _nt("lf", "search", '{\n"limit":NaN}', _token_refusal(12, "NaN", line=2)),
     _nt("crlf", "search", '{\r\n"limit":NaN}', _token_refusal(12, "NaN", line=2)),
+    _nt("lone-cr", "search", '{\r"limit":NaN}', _token_refusal(12, "NaN", line=2)),
+    _nt("double-cr", "search", '{\r\r"limit":NaN}', _token_refusal(12, "NaN", line=3)),
+    _nt("byte-order-mark", "search", b'\xef\xbb\xbf{"limit":NaN}', _token_refusal(16, "NaN")),
     _nt("tab", "search", '{\t"limit":NaN}', _token_refusal(14, "NaN")),
     _nt("two-byte-char-before", "search", '{"query":"é","limit":NaN}', _token_refusal(26, "NaN")),
     _nt("three-and-four-byte-chars-before", "search", '{"query":"' + chr(0x20AC) + chr(0x1F600) + '","limit":NaN}', _token_refusal(31, "NaN")),
